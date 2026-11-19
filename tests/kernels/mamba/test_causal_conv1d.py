@@ -489,3 +489,61 @@ def _create_ragged_varlen_ref_outs(
             max_query_len=max_query_len,
         )
         yield out_ref
+
+
+@pytest.mark.parametrize("has_initial_state", [False, True])
+@pytest.mark.parametrize("seqlens", [[37, 1000, 5, 513], [2048]])
+@pytest.mark.parametrize("out_split", [256, 512])
+def test_causal_conv1d_varlen_out_split(seqlens, out_split, has_initial_state):
+    # `out_split` writes the same values as the default layout, regrouped into
+    # dense token-major (dim // out_split, cu_seqlen, out_split) planes.
+    set_random_seed(0)
+    num_planes, width, extra = 3, 4, 96
+    dim = num_planes * out_split
+    batch = len(seqlens)
+    total = sum(seqlens)
+    # Channel-last, row-strided input like a slice of a fused projection.
+    proj = torch.randn(total, dim + extra, device=DEVICE, dtype=torch.bfloat16)
+    x = proj[:, :dim].transpose(0, 1)
+    weight = torch.randn(dim, width, device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
+    query_start_loc = torch.tensor(
+        [0] + torch.tensor(seqlens).cumsum(0).tolist(),
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    conv_states = torch.randn(
+        batch + 2, width - 1, dim, device=DEVICE, dtype=torch.bfloat16
+    ).transpose(1, 2)
+    cache_indices = torch.arange(batch, device=DEVICE, dtype=torch.int32) + 1
+    has_init = torch.full((batch,), has_initial_state, device=DEVICE)
+
+    states_ref = conv_states.clone()
+    states_split = conv_states.clone()
+    out_ref = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        states_ref,
+        query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_init,
+        activation="silu",
+    )
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        states_split,
+        query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_init,
+        activation="silu",
+        out_split=out_split,
+    )
+
+    assert out.shape == (num_planes, total, out_split)
+    assert out.is_contiguous()
+    expected = out_ref.reshape(num_planes, out_split, total).transpose(1, 2)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(states_split, states_ref, rtol=0, atol=0)

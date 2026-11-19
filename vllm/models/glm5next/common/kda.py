@@ -1030,7 +1030,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata_narrowed.prefill_has_initial_state
         if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
-            qkv_ns = causal_conv1d_fn(
+            # Planar conv output: q/k/v come back as dense token-major
+            # (n, local_projection_size) planes, so `_rearr` below is a view
+            # rather than a channel-major -> token-major transpose copy.
+            q_ns, k_ns, v_ns = causal_conv1d_fn(
                 qkv_ns.transpose(0, 1),
                 conv_weights,
                 conv_bias,
@@ -1040,8 +1043,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cache_indices=conv_cache_indices,
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+                out_split=self.local_projection_size,
+            ).unbind(0)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
