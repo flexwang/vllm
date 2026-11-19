@@ -81,6 +81,13 @@ def causal_conv1d_fn_cpu(
         out[:, bos:eos] = seq_out.squeeze(0)
         conv_states[slot, :, :state_len].copy_(conv_input[..., -state_len:].squeeze(0))
 
+    out_split = kwargs.get("out_split", 0)
+    if out_split > 0:
+        # Match the Triton wrapper's planar layout:
+        # (dim // out_split, cu_seq_len, out_split).
+        dim, cu_seqlen = out.shape
+        out = out.reshape(dim // out_split, out_split, cu_seqlen).transpose(1, 2)
+        out = out.contiguous()
     return out.to(original_x_dtype)
 
 

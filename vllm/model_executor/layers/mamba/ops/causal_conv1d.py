@@ -40,6 +40,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
+    stride_o_split: tl.int64,
     # others
     pad_slot_id: tl.constexpr,
     null_block_id: tl.constexpr,
@@ -52,6 +53,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    OUT_SPLIT: tl.constexpr = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -501,11 +503,21 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if OUT_SPLIT > 0:
+            # Planar output: channel c goes to plane c // OUT_SPLIT, so each
+            # plane is a dense token-major (seqlen, OUT_SPLIT) tensor.
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats // OUT_SPLIT) * stride_o_split
+                + (idx_feats % OUT_SPLIT) * stride_o_dim
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
@@ -523,6 +535,7 @@ def causal_conv1d_fn(
     null_block_id: int = NULL_BLOCK_ID,
     metadata=None,
     validate_data=False,
+    out_split: int = 0,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -563,7 +576,8 @@ def causal_conv1d_fn(
         for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at
         indices 0 and 3
-    out: same shape as `x`
+    out: same shape as `x`; with `out_split > 0` instead a dense
+        (dim // out_split, cu_seq_len, out_split) tensor (token-major planes).
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -572,7 +586,15 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out_split > 0:
+        assert x.shape[0] % out_split == 0
+        out = torch.empty(
+            (x.shape[0] // out_split, x.shape[1], out_split),
+            dtype=x.dtype,
+            device=x.device,
+        )
+    else:
+        out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -623,7 +645,10 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-    if out.dim() == 2:
+    stride_o_split = 0
+    if out_split > 0:
+        stride_o_split, stride_o_token, stride_o_dim = out.stride()
+    elif out.dim() == 2:
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
     else:
@@ -748,10 +773,12 @@ def causal_conv1d_fn(
         stride_cache_indices,
         stride_o_dim,
         stride_o_token,
+        stride_o_split,
         # others
         pad_slot_id,
         null_block_id,
         # META
+        OUT_SPLIT=out_split,
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
